@@ -7,12 +7,9 @@ import os
 
 st.set_page_config(page_title="Simulator Grile", layout="centered", page_icon="📝")
 
-# --- FUNCȚIE PARSARE PDF ---
+# --- FUNCȚIE PARSARE PDF (REPARATĂ) ---
 @st.cache_data
 def parse_pdf(pdf_source):
-    """
-    Parcurge PDF-ul (fie din bytes, fie cale de fișier), extrage textul și imaginile.
-    """
     if isinstance(pdf_source, bytes):
         doc = fitz.open(stream=pdf_source, filetype="pdf")
     else:
@@ -20,57 +17,88 @@ def parse_pdf(pdf_source):
         
     questions = []
     current_q = None
+    page_images = {} # Colectăm imaginile separat pentru fiecare pagină
 
-    for page in doc:
+    for page_num, page in enumerate(doc):
         blocks = page.get_text("dict")["blocks"]
         
-        for b in blocks:
-            # Bloc de TEXT
-            if b['type'] == 0:
-                text = ""
-                for l in b["lines"]:
-                    for s in l["spans"]:
-                        text += s["text"] + " "
-                text = text.strip()
+        # 1. Separăm textul de imagini și îl sortăm de sus în jos după coordonata Y (bbox[1])
+        text_blocks = [b for b in blocks if b['type'] == 0]
+        text_blocks.sort(key=lambda b: b["bbox"][1])
+        
+        image_blocks = [b for b in blocks if b['type'] == 1]
+        if image_blocks:
+            page_images[page_num] = [b["image"] for b in image_blocks]
 
-                if not text:
-                    continue
+        # 2. Parsăm textul curățat și ordonat
+        for b in text_blocks:
+            text = ""
+            for l in b["lines"]:
+                for s in l["spans"]:
+                    text += s["text"] + " "
+            text = text.strip()
 
-                # Întrebare nouă (Ex: "1. ", "23. ")
-                if re.match(r'^\d+\.', text):
-                    if current_q:
-                        questions.append(current_q)
-                    current_q = {
-                        "question": text, 
-                        "options": [], 
-                        "correct_idx": None, 
-                        "images": []
-                    }
+            if not text:
+                continue
+            
+            # Ignorăm headere/footere izolate (ex: numere de pagină)
+            if text.isdigit() and len(text) <= 3:
+                continue
+
+            # Întrebare nouă (suportă și spații înainte: " 1.", "23)")
+            if re.match(r'^\s*\d+[\.\)]', text):
+                if current_q:
+                    questions.append(current_q)
+                current_q = {
+                    "question": text, 
+                    "options": [], 
+                    "correct_idx": None, 
+                    "images": [],
+                    "page": page_num # Reținem unde a apărut întrebarea
+                }
+            
+            # Variantă de răspuns ("a)", " B. ")
+            elif re.match(r'^\s*[a-eA-E][\)\.]', text) and current_q is not None:
+                is_correct = '*' in text
+                clean_text = text.replace('*', '').strip()
+                current_q["options"].append(clean_text)
                 
-                # Variantă de răspuns (Ex: "a) ", "b) ")
-                elif re.match(r'^[a-z]\)', text) and current_q is not None:
-                    is_correct = '*' in text
-                    clean_text = text.replace('*', '').strip()
-                    current_q["options"].append(clean_text)
+                if is_correct:
+                    current_q["correct_idx"] = len(current_q["options"]) - 1
                     
-                    if is_correct:
-                        current_q["correct_idx"] = len(current_q["options"]) - 1
-                        
-                # Text adițional pentru întrebare
-                elif current_q is not None and len(current_q["options"]) == 0:
+            # Text adițional - îl alipim la locul potrivit
+            elif current_q is not None:
+                if len(current_q["options"]) == 0:
                     current_q["question"] += "\n" + text
-                    
-                # Text adițional pentru ultima variantă
-                elif current_q is not None and len(current_q["options"]) > 0:
+                else:
                     current_q["options"][-1] += " " + text
 
-            # Bloc de IMAGINE
-            elif b['type'] == 1:
-                if current_q is not None:
-                    current_q["images"].append(b["image"])
-
+    # Salvăm ultima întrebare din buclă
     if current_q:
         questions.append(current_q)
+
+    # 3. ASIGNARE INTELIGENTĂ A IMAGINILOR
+    # Căutăm cuvinte care ne "trădează" că întrebarea are nevoie de o poză
+    keywords = ['figur', 'diagram', 'mai jos', 'codul', 'grafic']
+    
+    for p_num, images in page_images.items():
+        # Extragem întrebările de pe pagina curentă (sau adiacente pentru overlap)
+        candidate_qs = [q for q in questions if q["page"] in (p_num, p_num - 1, p_num + 1)]
+        
+        for img_bytes in images:
+            assigned = False
+            # Strategia A: Match pe cuvinte cheie
+            for q in candidate_qs:
+                if any(kw in q["question"].lower() for kw in keywords):
+                    q["images"].append(img_bytes)
+                    assigned = True
+                    break
+            
+            # Strategia B: Fallback (dacă nu găsim cuvinte cheie, o dăm primei întrebări de pe pagină)
+            if not assigned:
+                qs_on_page = [q for q in questions if q["page"] == p_num]
+                if qs_on_page:
+                    qs_on_page[0]["images"].append(img_bytes)
 
     return questions
 
@@ -90,42 +118,35 @@ else:
 if questions:
     st.title("🎯 Simulator Grile")
     
-    # Inițializare stări în session_state pentru a nu pierde progresul la re-run
     if "user_answers" not in st.session_state:
         st.session_state.user_answers = {}
     if "current_index" not in st.session_state:
         st.session_state.current_index = 0
 
-    # Sidebar pentru navigare
     st.sidebar.header("🧩 Navigare rapidă")
     q_titles = [f"Întrebarea {i+1}" for i in range(len(questions))]
     selected_q_idx = st.sidebar.selectbox("Mergi la:", q_titles, index=st.session_state.current_index)
     st.session_state.current_index = q_titles.index(selected_q_idx)
     
-    # Statistici simple în sidebar
     answered_count = len(st.session_state.user_answers)
     st.sidebar.divider()
     st.sidebar.metric("Grile rezolvate", f"{answered_count} / {len(questions)}")
 
-    # Întrebarea curentă
     idx = st.session_state.current_index
     q = questions[idx]
 
     st.subheader(f"Întrebarea {idx + 1} din {len(questions)}")
     st.markdown(f"**{q['question']}**")
 
-    # Afișare imagini aferente întrebării
     if q["images"]:
         for img_bytes in q["images"]:
             try:
                 image = Image.open(io.BytesIO(img_bytes))
                 st.image(image, use_container_width=True)
-            except Exception as e:
-                st.error("Nu s-a putut reda o imagine din interiorul PDF-ului.")
+            except Exception:
+                pass # Ignorăm subtil erorile de decodare a imaginii
 
-    # Afișare opțiuni radio
     if q["options"]:
-        # Identificăm indexul salvat anterior (dacă există) pentru a-l pre-selecta
         saved_ans = st.session_state.user_answers.get(idx, None)
         default_radio_idx = q["options"].index(saved_ans) if saved_ans in q["options"] else None
 
@@ -136,7 +157,6 @@ if questions:
             key=f"radio_{idx}"
         )
         
-        # Salvăm răspunsul și afișăm feedback instant
         if user_choice:
             st.session_state.user_answers[idx] = user_choice
 
@@ -151,7 +171,6 @@ if questions:
 
     st.divider()
 
-    # Butoane de navigare Înapoi / Înainte
     col1, col2 = st.columns([1, 1])
     with col1:
         if st.button("⬅️ Înapoi", disabled=(idx == 0)):
