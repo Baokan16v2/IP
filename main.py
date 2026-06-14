@@ -130,7 +130,10 @@ if raw_questions:
     q = questions[idx]
 
     st.subheader(f"Întrebarea {idx + 1} / {len(questions)}")
-    st.markdown(f"**{q['question']}**")
+    
+    # ELIMINĂM INDEXUL ORIGINAL (ex: "42. ") DIN TEXTUL ÎNTREBĂRII
+    clean_question = re.sub(r'^\d{1,3}\.\s*', '', q['question'])
+    st.markdown(f"**{clean_question}**")
 
     # Afișare poze
     if q["images"]:
